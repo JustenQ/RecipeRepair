@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Recipe Batch Processor</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.12.313/pdf.min.js"></script>
+
+<script>
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.12.313/pdf.worker.min.js';
+</script>
+
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    .section { margin-top: 30px; }
+    #fileList { margin-top: 10px; }
+    #output table { border-collapse: collapse; margin-top: 20px; width: 100%; }
+    #output th, #output td { border: 1px solid #ccc; padding: 6px; text-align: left; }
+    #output th { background: #f0f0f0; }
+  </style>
+</head>
+<body>
+
+<h1>📄 Recipe Batch Processor</h1>
+
+<div>
+  <input type="file" id="filePicker" accept="application/pdf">
+  <button id="generateBtn">Generate Report</button>
+  <div id="fileList"></div>
+</div>
+
+<div class="section">
+  <h2>🛒 Total Ingredients</h2>
+  <div id="totalOutput">No data yet.</div>
+</div>
+
+<div class="section">
+  <h2>📊 Per-Event Grid</h2>
+  <div id="gridOutput">No data yet.</div>
+</div>
+
+<script>
+const filePicker = document.getElementById('filePicker');
+const generateBtn = document.getElementById('generateBtn');
+const fileListDiv = document.getElementById('fileList');
+const totalOutput = document.getElementById('totalOutput');
+const gridOutput = document.getElementById('gridOutput');
+
+let filesToProcess = [];
+
+filePicker.addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (file) {
+    filesToProcess.push(file);
+    const li = document.createElement('div');
+    li.textContent = `➕ ${file.name}`;
+    fileListDiv.appendChild(li);
+  }
+  filePicker.value = ''; // reset for re-selection
+});
+
+generateBtn.addEventListener('click', async () => {
+  totalOutput.innerHTML = "Processing...";
+  gridOutput.innerHTML = "Processing...";
+
+  const results = [];
+
+  for (let file of filesToProcess) {
+    const text = await extractTextFromPDF(file);
+    const ingredients = parseIngredients(text);
+    const eventName = extractEventName(text);
+    results.push({ fileName: file.name, eventName, ingredients });
+  }
+
+  const totalList = getTotalIngredients(results);
+  const matrix = buildEventGrid(results);
+
+  totalOutput.innerHTML = renderTableFromObject(totalList, ['Ingredient', 'Total']);
+  gridOutput.innerHTML = renderGrid(matrix);
+});
+
+// PDF text extraction
+async function extractTextFromPDF(file) {
+  const data = await file.arrayBuffer();
+  const pdf  = await pdfjsLib.getDocument({ data }).promise;
+  let fullText = '';
+
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page   = await pdf.getPage(p);
+    const { items } = await page.getTextContent();
+    // bucket items by rounded Y-position
+    const rows = {};
+    items.forEach(item => {
+      // transform = [a, b, c, d, x, y]
+      const y = Math.round(item.transform[5]);
+      if (!rows[y]) rows[y] = [];
+      rows[y].push({ x: item.transform[4], str: item.str });
+    });
+    // sort rows top→bottom (descending Y), then items left→right (ascending X)
+    Object.keys(rows)
+      .sort((a,b) => b - a)
+      .forEach(y => {
+        const line = rows[y]
+          .sort((a,b) => a.x - b.x)
+          .map(o => o.str)
+          .join(' ')
+          .trim();
+        if (line) fullText += line + '\n';
+      });
+  }
+
+  return fullText;
+}
+
+// Parse ingredient lines
+function parseIngredients(text) {
+  const lines = text.split('\n');
+  const ingredientRegex = /(.+?)\s+(\d+(\.\d+)?)\s+(POUND|OZL|OZW|GALLON|QUART|CUP)/i;
+  const ingredients = [];
+
+  for (let line of lines) {
+    const match = line.match(ingredientRegex);
+    if (!match) continue;
+    let name   = match[1].trim().replace(/\s{2,}/g,' ');
+    let amount = parseFloat(match[2]);
+    let unit   = match[4].toUpperCase();
+    ingredients.push({ name, amount, unit });
+  }
+  return ingredients;
+}
+
+
+// Get event name from recipe
+function extractEventName(text) {
+  const match = text.match(/Recipe Name:\s*(.+?)\s+Serves:/i);
+  return match ? match[1].trim() : "Unnamed Event";
+}
+
+// Combine and total all ingredients
+function getTotalIngredients(data) {
+  const total = {};
+  for (let recipe of data) {
+    for (let ing of recipe.ingredients) {
+      const key = normalizeName(ing.name) + ` (${ing.unit})`;
+      total[key] = (total[key] || 0) + ing.amount;
+    }
+  }
+  return total;
+}
+
+// ——— Ingredient Display Name Overrides ———
+// Fill this out with any special mappings you need:
+const displayNameMap = {
+  'Rice – Arborio Italian Superino': 'Arborio Rice',
+  'Butter – Unsalted':             'Unsalted Butter',
+  'Shredded Parmesan Cheese':      'Parmesan Cheese',
+  // …add more as you find them
+};
+
+function getDisplayName(raw) {
+  // try exact map first
+  if (displayNameMap[raw]) return displayNameMap[raw];
+  // otherwise: title‑case and swap order if you like
+  // simple fallback: capitalize each word
+  return raw
+    .toLowerCase()
+    .split(/\s+/)
+    .map(w => w[0].toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+// ——— Quantity Formatting ———
+function formatQuantity(amount, unit) {
+  if (unit === 'POUND') {
+    const lbs = Math.floor(amount);
+    const oz  = ((amount - lbs) * 16).toFixed(1);
+    return `${lbs} lb${oz>0 ? ' ' + oz + ' oz' : ''}`;
+  }
+  // you can add more unit‑specific formatting here:
+  // e.g. QUART → "X qt Y pt", CUP → "X cups"
+  return `${amount.toFixed(2)} ${unit.toLowerCase()}`;
+}
+
+// Build per-event matrix
+function buildEventGrid(data) {
+  const grid = {};
+  const allEvents = data.map(r => r.eventName);
+
+  for (let recipe of data) {
+    for (let ing of recipe.ingredients) {
+      const key = normalizeName(ing.name) + ` (${ing.unit})`;
+      if (!grid[key]) grid[key] = {};
+      grid[key][recipe.eventName] = (grid[key][recipe.eventName] || 0) + ing.amount;
+    }
+  }
+
+  return { ingredients: Object.keys(grid), events: allEvents, grid };
+}
+
+// Render total ingredient table
+// Render total ingredient table
+function renderTableFromObject(obj, headers) {
+  let html = `<table><tr><th>${headers[0]}</th><th>${headers[1]}</th></tr>`;
+  for (let rawName in obj) {
+    // split off the unit from the key
+    const m = rawName.match(/(.+)\s+\((\w+)\)$/);
+    const name = m ? m[1] : rawName;
+    const unit = m ? m[2] : '';
+    const amount = obj[rawName];
+
+    html += `<tr>
+      <td>${ getDisplayName(name) }</td>
+      <td>${ formatQuantity(amount, unit) }</td>
+    </tr>`;
+  }
+  html += '</table>';
+  return html;
+}
+
+// Render per-event grid table
+function renderGrid({ ingredients, events, grid }) {
+  let html = `<table><tr><th>Ingredient</th>`;
+  for (let ev of events) {
+    html += `<th>${ev}</th>`;
+  }
+  html += `</tr>`;
+
+  for (let rawName of ingredients) {
+    const m = rawName.match(/(.+)\s+\((\w+)\)$/);
+    const name = m ? m[1] : rawName;
+    const unit = m ? m[2] : '';
+    html += `<tr><td>${ getDisplayName(name) }</td>`;
+    for (let ev of events) {
+      const amt = grid[rawName][ev] || 0;
+      html += `<td>${ amt ? formatQuantity(amt, unit) : '' }</td>`;
+    }
+    html += `</tr>`;
+  }
+
+  html += `</table>`;
+  return html;
+}
+
+// Normalize ingredient names
+function normalizeName(name) {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, '').trim();
+}
+</script>
+
+</body>
+</html>
+
